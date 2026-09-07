@@ -353,6 +353,11 @@ where
     let mut failure: Option<anyhow::Error> = None;
     let mut usage = TokenUsage::default();
     let mut deltas_received = false;
+    // Reasoning deltas stay buffered here until the provider signals the
+    // reasoning boundary; each flush then reaches the caller as one
+    // complete thought. Mirrors the codex_client and chat-completions
+    // drivers (see `flush_pending_thought`).
+    let mut pending_thought = String::new();
 
     loop {
         tokio::select! {
@@ -426,6 +431,10 @@ where
                         }
                         "response.output_text.delta" => {
                             if let Some(delta) = event.delta {
+                                crate::llm_client::flush_pending_thought(
+                                    &mut pending_thought,
+                                    &mut on_thought,
+                                );
                                 on_token(&delta);
                                 full_text.push_str(&delta);
                                 deltas_received = true;
@@ -438,6 +447,10 @@ where
                             {
                                 match item {
                                     OutputItem::Message { role, content } => {
+                                        crate::llm_client::flush_pending_thought(
+                                            &mut pending_thought,
+                                            &mut on_thought,
+                                        );
                                         if role.as_deref() == Some("assistant") && !deltas_received {
                                             for c in content {
                                                 if let OutputItemContent::OutputText { text } = c {
@@ -449,6 +462,10 @@ where
                                         made_progress = true;
                                     }
                                     OutputItem::FunctionCall { id, name, arguments, call_id } => {
+                                        crate::llm_client::flush_pending_thought(
+                                            &mut pending_thought,
+                                            &mut on_thought,
+                                        );
                                         let resolved_id = call_id
                                             .or(id)
                                             .unwrap_or_else(|| format!("call_{}", tool_calls.len()));
@@ -471,8 +488,12 @@ where
                             }
                         }
                         "response.completed" => {
+                            crate::llm_client::flush_pending_thought(
+                                &mut pending_thought,
+                                &mut on_thought,
+                            );
                             if let Some(final_body) = event.response
-                                && let Some(u) = final_body.usage
+                            && let Some(u) = final_body.usage
                             {
                                 usage = u.into_usage();
                             }
@@ -480,6 +501,10 @@ where
                             break;
                         }
                         "response.failed" => {
+                            crate::llm_client::flush_pending_thought(
+                                &mut pending_thought,
+                                &mut on_thought,
+                            );
                             let msg = event
                                 .response
                                 .and_then(|r| r.error)
@@ -499,6 +524,10 @@ where
                             break;
                         }
                         "response.incomplete" => {
+                            crate::llm_client::flush_pending_thought(
+                                &mut pending_thought,
+                                &mut on_thought,
+                            );
                             if let Some(final_body) = event.response {
                                 if let Some(u) = final_body.usage {
                                     usage = u.into_usage();
@@ -530,12 +559,24 @@ where
                                 );
                             }
                         }
+                        // Chain-of-thought deltas stay buffered until the
+                        // provider signals the reasoning boundary, mirroring
+                        // the codex_client and chat-completions drivers so
+                        // ACP thought blocks are independent of token rate.
                         "response.reasoning_text.delta"
                         | "response.reasoning_summary_text.delta" => {
                             if let Some(delta) = event.delta {
-                                on_thought(&delta);
+                                pending_thought.push_str(&delta);
                                 made_progress = true;
                             }
+                        }
+                        "response.reasoning_text.done"
+                        | "response.reasoning_summary_text.done" => {
+                            crate::llm_client::flush_pending_thought(
+                                &mut pending_thought,
+                                &mut on_thought,
+                            );
+                            made_progress = true;
                         }
                         _ => {
                             made_progress = true;
@@ -558,9 +599,11 @@ where
     }
 
     if let Some(err) = failure {
+        crate::llm_client::flush_pending_thought(&mut pending_thought, &mut on_thought);
         return Err(err);
     }
     if cancel.is_cancelled() {
+        crate::llm_client::flush_pending_thought(&mut pending_thought, &mut on_thought);
         return Ok(ResponsesStreamOutcome {
             response: LlmResponse::Text {
                 text: full_text,
@@ -571,11 +614,15 @@ where
         });
     }
     if !completed {
+        crate::llm_client::flush_pending_thought(&mut pending_thought, &mut on_thought);
         return Err(anyhow::Error::new(IncompleteStreamError::new(
             "Responses SSE",
             "response.completed",
         )));
     }
+
+    crate::llm_client::flush_pending_thought(&mut pending_thought, &mut on_thought);
+
     if tool_calls.is_empty() {
         Ok(ResponsesStreamOutcome {
             response: LlmResponse::Text {
@@ -840,6 +887,46 @@ mod tests {
         assert!(!crate::llm_client::is_incomplete_stream_error(&err));
         assert_eq!(collected.lock().unwrap().as_str(), "");
         assert_eq!(thoughts.lock().unwrap().as_str(), "thinking");
+    }
+
+    #[tokio::test]
+    async fn shared_responses_stream_batches_reasoning_deltas_into_one_thought() {
+        // Fragment-scale deltas like the raw-reasoning stream; without
+        // boundary buffering each one became its own agent_thought_chunk
+        // and clients rendered a thought split mid-word.
+        let raw = concat!(
+            "data: {\"type\":\"response.reasoning_text.delta\",\"delta\":\"pro\"}\n\n",
+            "data: {\"type\":\"response.reasoning_text.delta\",\"delta\":\"vider\"}\n\n",
+            "data: {\"type\":\"response.reasoning_text.delta\",\"delta\":\"-bound\"}\n\n",
+            "data: {\"type\":\"response.reasoning_text.delta\",\"delta\":\"ary\"}\n\n",
+            "data: {\"type\":\"response.reasoning_text.done\"}\n\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"answer\"}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{}}\n\n",
+        );
+        let stream = stream::iter(vec![Ok(raw.as_bytes().to_vec())]);
+        let (on_token, collected) = collect_tokens();
+        let thoughts = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let thoughts_for_cb = std::sync::Arc::clone(&thoughts);
+        let on_thought: TokenSink = Box::new(move |text: &str| {
+            thoughts_for_cb.lock().unwrap().push(text.to_string());
+        });
+
+        let resp = drive_responses_sse_stream(
+            stream,
+            on_token,
+            on_thought,
+            CancellationToken::new(),
+            IdleTimeouts::uniform(std::time::Duration::from_secs(5)),
+        )
+        .await
+        .expect("response.completed should finish the stream");
+
+        match resp.response {
+            LlmResponse::Text { text, .. } => assert_eq!(text, "answer"),
+            other => panic!("expected Text, got {other:?}"),
+        }
+        assert_eq!(collected.lock().unwrap().as_str(), "answer");
+        assert_eq!(*thoughts.lock().unwrap(), vec!["provider-boundary"]);
     }
 
     #[tokio::test]
