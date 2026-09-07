@@ -2332,11 +2332,25 @@ where
                                 // reasoning phase for this assistant
                                 // response. Flush before forwarding content,
                                 // including when both fields share one chunk.
+                                // An *empty* content string is not that
+                                // boundary: providers that co-emit
+                                // `"content": ""` with every reasoning delta
+                                // (Ollama's OpenAI-compat endpoint among
+                                // them) would otherwise flush once per token,
+                                // which clients render as one-word thought
+                                // blocks. Real boundaries still flush: the
+                                // first non-empty content, tool-call
+                                // fragments, finish_reason, and [DONE].
                                 if let Some(content) = &choice.delta.content {
-                                    flush_pending_thought(&mut pending_reasoning, &mut on_thought);
                                     made_progress = true;
-                                    on_token(content);
-                                    full_text.push_str(content);
+                                    if !content.is_empty() {
+                                        flush_pending_thought(
+                                            &mut pending_reasoning,
+                                            &mut on_thought,
+                                        );
+                                        on_token(content);
+                                        full_text.push_str(content);
+                                    }
                                 }
                                 // Accumulate tool call fragments
                                 if let Some(tc_chunks) = &choice.delta.tool_calls {
@@ -3585,6 +3599,59 @@ mod tests {
 
         assert!(matches!(result, LlmResponse::ToolCalls { .. }));
         assert_eq!(*thoughts.lock().unwrap(), vec!["check first"]);
+    }
+
+    /// Some OpenAI-compatible providers (Ollama's compat endpoint among
+    /// them) co-emit `"content": ""` alongside every reasoning delta.
+    /// An empty content string is not the end of the reasoning phase:
+    /// flushing on it emitted one thought per token, which clients render
+    /// as single-word thought blocks.
+    #[tokio::test]
+    async fn drive_sse_stream_does_not_flush_thoughts_on_empty_content_deltas() {
+        let chunks: Vec<Result<Vec<u8>>> = vec![
+            Ok(b"data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"agents\",\"content\":\"\"}}]}\n".to_vec()),
+            Ok(b"data: {\"choices\":[{\"delta\":{\"reasoning_content\":\" as config\",\"content\":\"\"}}]}\n".to_vec()),
+            Ok(b"data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"urable\",\"content\":\"\"}}]}\n".to_vec()),
+            Ok(b"data: {\"choices\":[{\"delta\":{\"content\":\"done\"}}]}\n".to_vec()),
+            Ok(b"data: [DONE]\n".to_vec()),
+        ];
+        let s = stream::iter(chunks);
+
+        let (on_token, tokens) = collect_tokens();
+        let thoughts = Arc::new(Mutex::new(Vec::<String>::new()));
+        let thoughts_for_cb = Arc::clone(&thoughts);
+        let on_thought: TokenSink = Box::new(move |s: &str| {
+            thoughts_for_cb.lock().unwrap().push(s.to_string());
+        });
+
+        let result = drive_sse_stream(
+            s,
+            on_token,
+            on_thought,
+            CancellationToken::new(),
+            IdleTimeouts::uniform(Duration::from_secs(90)),
+        )
+        .await
+        .expect("should complete");
+
+        match result {
+            LlmResponse::Text {
+                text,
+                reasoning_content,
+                ..
+            } => {
+                assert_eq!(text, "done");
+                assert_eq!(reasoning_content.as_deref(), Some("agents as configurable"));
+            }
+            other => panic!("expected text response, got {other:?}"),
+        }
+        assert_eq!(*tokens.lock().unwrap(), vec!["done"]);
+        // The whole reasoning stream must arrive as one batch: per-token
+        // flushes here are the single-word thought blocks clients show.
+        assert_eq!(
+            *thoughts.lock().unwrap(),
+            vec!["agents as configurable".to_string()]
+        );
     }
 
     #[test]
